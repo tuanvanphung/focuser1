@@ -14,27 +14,20 @@ use focuser_common::types::AppMatchType;
 use focuser_core::{BlockEngine, Database};
 use std::sync::Arc;
 use tauri::{
-    Manager,
+    Manager, Emitter,
     menu::{MenuBuilder, MenuItemBuilder},
     tray::TrayIconBuilder,
 };
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+// Added for secure password file writes and hashing
+use sha2::{Sha256, Digest};
+use std::fs;
+
 /// Shared application state.
-///
-/// This *is* `focuser_app::AppContext` — the GUI no longer owns a private copy of
-/// the engine handle. Kept as an alias so the 70-odd existing `AppState`
-/// references keep compiling while commands are ported over domain by domain.
-///
-/// New code should say `AppContext`.
 pub use focuser_app::{AppContext as AppState, PomodoroEvent};
 
-/// Pushes the engine's blocked-domain set into the system hosts file.
-///
-/// This is the GUI's implementation of the one system side effect the command
-/// core needs. Injecting it keeps `focuser-app` free of any dependency on a
-/// particular frontend, and lets tests substitute a no-op.
 struct HostsSync;
 
 impl focuser_app::SystemSync for HostsSync {
@@ -61,13 +54,61 @@ impl focuser_app::SystemSync for HostsSync {
     }
 }
 
-/// How recently an extension must have checked in to count as connected.
 const EXTENSION_SEEN_SECS: u64 = 120;
 
+/// Securely terminates the application from the frontend
+#[tauri::command]
+fn exit_app() {
+    let _ = crate::blocker::remove_hosts_blocks();
+    std::process::exit(0);
+}
+
+// --- SECURE BACKEND PASSWORD HELPERS & COMMANDS ---
+
+fn get_password_file_path() -> std::path::PathBuf {
+    let project_dirs = ProjectDirs::from("com", "focuser", "Focuser")
+        .expect("Could not determine project directories");
+    project_dirs.data_dir().join(".focuser_pwd")
+}
+
+fn hash_password(password: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(password.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+#[tauri::command]
+fn check_has_password() -> bool {
+    get_password_file_path().exists()
+}
+
+#[tauri::command]
+fn set_app_password(password: String) -> Result<(), String> {
+    if password.trim().len() < 4 {
+        return Err("Password must be at least 4 characters.".into());
+    }
+    let hashed = hash_password(&password);
+    let path = get_password_file_path();
+    fs::write(&path, hashed).map_err(|e| format!("Failed to save password: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn verify_app_password(password: String) -> bool {
+    let path = get_password_file_path();
+    if !path.exists() {
+        return false;
+    }
+    if let Ok(stored_hash) = fs::read_to_string(&path) {
+        let input_hash = hash_password(&password);
+        return stored_hash.trim() == input_hash.trim();
+    }
+    false
+}
+
+// --------------------------------------------------
+
 fn main() {
-    // Regenerate frontend TypeScript bindings and exit. Handled before any
-    // logging, database access, or window creation so it works in CI and in a
-    // checkout where another Focuser instance already holds the database.
     if std::env::args().any(|a| a == "--export-bindings") {
         std::process::exit(if typed_commands::export_bindings() {
             0
@@ -110,7 +151,6 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            // Another instance tried to launch — bring existing window to front
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
                 let _ = window.unminimize();
@@ -126,9 +166,7 @@ fn main() {
         ))
         .manage(state)
         .invoke_handler(tauri::generate_handler![
-            // Everything the application can do goes through one command.
             typed_commands::run_command,
-            // Native shims that need a Tauri handle or OS process access.
             native::pick_app_file,
             native::pick_import_file,
             native::save_configuration,
@@ -137,43 +175,34 @@ fn main() {
             native::do_update,
             autostart::is_autostart_enabled,
             autostart::set_autostart,
+            exit_app,
+            check_has_password,   // Registered secure check command
+            set_app_password,     // Registered secure set command
+            verify_app_password,  // Registered secure verify command
         ])
         .setup(move |app| {
-            // Once, on a fresh install. This used to re-enable autostart on
-            // every launch whenever it found it off, which meant nobody could
-            // ever turn it off — see #10.
-            // Applies the first-run default, then finishes any autostart change
-            // the UI could not make itself. If the logon task launched us we are
-            // elevated here, which is the one moment schtasks will cooperate.
             if let Ok(engine) = state_for_blocker.engine.lock() {
                 autostart::reconcile(app.handle(), engine.db());
             }
 
-            // Spawn background blocking loop
             let blocker_state = Arc::clone(&state_for_blocker);
             std::thread::spawn(move || {
                 blocker::run_blocking_loop(blocker_state);
             });
 
-            // Spawn extension API server
             let api_state = Arc::clone(&state_for_blocker);
             std::thread::spawn(move || {
                 api::run_api_server(api_state);
             });
 
-            // Spawn foreground-app watcher — feeds app allowance ticks.
             let watcher_state = Arc::clone(&state_for_blocker);
             std::thread::spawn(move || {
                 foreground_watcher::run_foreground_watcher(watcher_state);
             });
 
-            // Warm the icon cache so the Applications page does not pay for the
-            // Start Menu search on first open.
             let icon_state = Arc::clone(&state_for_blocker);
             std::thread::spawn(move || warm_app_icons(&icon_state));
 
-            // System tray icon. Built in the saved language; the tray exists
-            // before any window does, so it cannot ask the frontend.
             let tray_locale = state_for_blocker
                 .engine
                 .lock()
@@ -200,10 +229,6 @@ fn main() {
                         }
                     }
                     "quit" => {
-                        // Quitting removes the hosts entries and stops the
-                        // blocking loop, so while a lock asks us to stay put
-                        // this is the whole product being switched off in two
-                        // clicks. Refuse and show what is holding it.
                         if let Some(reason) = quit_blocked_by(&quit_state) {
                             warn!(%reason, "Refused to quit — a lock is active");
                             if let Some(window) = app.get_webview_window("main") {
@@ -213,8 +238,16 @@ fn main() {
                             }
                             return;
                         }
-                        let _ = crate::blocker::remove_hosts_blocks();
-                        std::process::exit(0);
+
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.show();
+                            let _ = window.unminimize();
+                            let _ = window.set_focus();
+                            let _ = window.emit("tray-quit-requested", ());
+                        } else {
+                            let _ = crate::blocker::remove_hosts_blocks();
+                            std::process::exit(0);
+                        }
                     }
                     _ => {}
                 })
@@ -229,14 +262,12 @@ fn main() {
                 })
                 .build(app)?;
 
-            // Poll for "show window" and "install extension" requests
             let show_handle = app.handle().clone();
             let show_state = Arc::clone(&state_for_blocker);
             std::thread::spawn(move || {
                 loop {
                     std::thread::sleep(std::time::Duration::from_millis(500));
 
-                    // Show window requests
                     if api::SHOW_WINDOW_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
                         && let Some(window) = show_handle.get_webview_window("main")
                     {
@@ -244,7 +275,6 @@ fn main() {
                         let _ = window.set_focus();
                     }
 
-                    // Extension install prompt — show window + in-app modal
                     if api::EXTENSION_PROMPT_REQUESTED
                         .swap(false, std::sync::atomic::Ordering::Relaxed)
                     {
@@ -255,12 +285,9 @@ fn main() {
                             let _ = window.show();
                             let _ = window.set_focus();
 
-                            // Inject themed in-app modal with retry
-                            // The webview may not be ready immediately after show()
                             let js = build_extension_modal_js(&browser_name, &show_state);
                             let win = window.clone();
                             std::thread::spawn(move || {
-                                // Try multiple times with increasing delays
                                 for delay_ms in [500, 1000, 1500] {
                                     std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                                     if win.eval(&js).is_ok() {
@@ -273,7 +300,6 @@ fn main() {
                 }
             });
 
-            // Close to tray instead of quitting
             let app_handle = app.handle().clone();
             let window = app.get_webview_window("main").unwrap();
             window.on_window_event(move |event| {
@@ -291,13 +317,11 @@ fn main() {
         .expect("error while building Focuser")
         .run(|_app_handle, event| {
             if let tauri::RunEvent::Exit = event {
-                // Always clean up hosts file when the app exits
                 let _ = blocker::remove_hosts_blocks();
             }
         });
 }
 
-/// Get the extension store URL for a given browser.
 fn extension_store_url(browser_name: &str) -> (&'static str, &'static str) {
     match browser_name {
         "Mozilla Firefox" => (
@@ -311,7 +335,6 @@ fn extension_store_url(browser_name: &str) -> (&'static str, &'static str) {
     }
 }
 
-/// Get the browser executable for launching with a URL.
 fn browser_launch_cmd(browser_name: &str) -> &'static str {
     match browser_name {
         "Mozilla Firefox" => "firefox",
@@ -322,12 +345,6 @@ fn browser_launch_cmd(browser_name: &str) -> &'static str {
     }
 }
 
-/// Build JavaScript to inject a themed modal into the Focuser UI.
-/// A small overlay explaining why Quit did nothing.
-///
-/// Injected rather than routed through the frontend because the tray menu can
-/// be used while the window has never been opened, so there may be no React
-/// tree listening yet.
 fn build_locked_modal_js(reason: &str, state: &Arc<AppState>) -> String {
     let locale = state
         .engine
@@ -335,9 +352,6 @@ fn build_locked_modal_js(reason: &str, state: &Arc<AppState>) -> String {
         .map(|e| i18n::saved_locale(e.db()))
         .unwrap_or_else(|_| "en".to_string());
     let text = i18n::strings(&locale);
-    // The reason carries a user-chosen list name, so it goes in as JSON rather
-    // than being pasted into the source. The translated strings go the same way:
-    // an apostrophe in a Spanish sentence would otherwise close a JS string.
     let reason = serde_json::to_string(reason).unwrap_or_else(|_| "\"a lock is active\"".into());
     let locked_title = serde_json::to_string(text.locked_title).unwrap_or_default();
     let locked_body = serde_json::to_string(text.locked_body).unwrap_or_default();
@@ -381,8 +395,6 @@ fn build_locked_modal_js(reason: &str, state: &Arc<AppState>) -> String {
     )
 }
 
-/// Reads every application rule's icon once at startup, so opening the
-/// Applications page is a cache hit rather than a Start Menu search.
 fn warm_app_icons(state: &Arc<AppState>) {
     let Ok(engine) = state.engine.lock() else {
         return;
@@ -406,10 +418,6 @@ fn warm_app_icons(state: &Arc<AppState>) {
     }
 }
 
-/// Why quitting is refused right now, or `None` if it is allowed.
-///
-/// Only locks that asked to prevent it count. A lock set without that box
-/// ticked is a commitment about the block list, not about the app staying up.
 fn quit_blocked_by(state: &Arc<AppState>) -> Option<String> {
     let engine = state.engine.lock().ok()?;
     let list = engine
@@ -426,8 +434,6 @@ fn quit_blocked_by(state: &Arc<AppState>) -> Option<String> {
     ))
 }
 
-/// Coarse, human phrasing. The exact second does not matter to someone being
-/// told they cannot quit yet.
 fn format_remaining(secs: u64) -> String {
     let mins = secs.div_ceil(60);
     match mins {
@@ -466,8 +472,6 @@ fn build_extension_modal_js(browser_name: &str, state: &Arc<AppState>) -> String
         .unwrap_or_else(|_| "en".to_string());
     let text = i18n::strings(&locale);
 
-    // Encoded as JSON so an apostrophe in a translation cannot close a JS
-    // string, then substituted in the page rather than here.
     let ext_title = serde_json::to_string(text.extension_title).unwrap_or_default();
     let ext_body = serde_json::to_string(text.extension_body).unwrap_or_default();
     let ext_install = serde_json::to_string(text.extension_install).unwrap_or_default();
@@ -627,8 +631,6 @@ mod tests {
 
     #[test]
     fn a_lock_that_did_not_ask_to_prevent_quitting_does_not() {
-        // Locking a list is a commitment about that list. Only the explicit
-        // checkbox turns it into a commitment about the app staying up.
         assert!(quit_blocked_by(&state_with(locked(false, 45))).is_none());
     }
 

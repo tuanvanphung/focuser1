@@ -1,3 +1,6 @@
+import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core"; // Calls our secure Rust password commands
+import { listen } from "@tauri-apps/api/event"; // Listens for tauri events (like the quit menu request)
 import {
   AppWindow,
   BarChart3,
@@ -20,8 +23,6 @@ import { useApplySavedLanguage } from "@/lib/language";
 import { cn } from "@/lib/utils";
 import { m } from "@/paraglide/messages.js";
 
-// `label` is a function, not a string: a message read at module scope would
-// freeze the locale that was active when this file was imported.
 const NAV = [
   { to: "/", label: m.nav_dashboard, icon: LayoutDashboard, end: true },
   { to: "/block-lists", label: m.nav_block_lists, icon: ListChecks },
@@ -34,26 +35,242 @@ const NAV = [
 ] as const;
 
 export function AppLayout() {
-  // Wraps every route, so this is the one place the saved language reaches the
-  // whole app rather than only the page that happens to read it.
   useApplySavedLanguage();
+
+  const [isUnlocked, setIsUnlocked] = useState(false);
+  const [hasPassword, setHasPassword] = useState(false);
+  const [passwordInput, setPasswordInput] = useState("");
+  const [error, setError] = useState("");
+
+  // System Tray Quit States
+  const [showQuitModal, setShowQuitModal] = useState(false);
+  const [quitPasswordInput, setQuitPasswordInput] = useState("");
+  const [quitError, setQuitError] = useState("");
+
+  // Check backend file on mount to see if a password exists
+  useEffect(() => {
+    async function checkPasswordStatus() {
+      const hasPwd = await invoke<boolean>("check_has_password");
+      setHasPassword(hasPwd);
+      setIsUnlocked(!hasPwd); // If no password exists, unlock immediately
+    }
+    checkPasswordStatus();
+  }, []);
+
+  // Re-lock when the window is re-shown from tray
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    async function listenWindowFocus() {
+      const { getCurrentWindow } = await import("@tauri-apps/api/window");
+      const appWindow = getCurrentWindow();
+
+      unlisten = await appWindow.onFocusChanged(async ({ payload: focused }) => {
+        if (focused) {
+          const hasPwd = await invoke<boolean>("check_has_password");
+          if (hasPwd) {
+            setIsUnlocked(false);
+            setPasswordInput("");
+            setError("");
+          }
+          setHasPassword(hasPwd);
+        }
+      });
+    }
+
+    listenWindowFocus();
+
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  // Listen for Tray "Quit" menu clicks
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+
+    const setupListener = async () => {
+      unlisten = await listen("tray-quit-requested", async () => {
+        const hasPwd = await invoke<boolean>("check_has_password");
+        if (!hasPwd) {
+          // If no password exists, close instantly
+          invoke("exit_app");
+        } else {
+          // If a password exists, open the verification modal
+          setShowQuitModal(true);
+        }
+      });
+    };
+
+    setupListener();
+
+    return () => {
+      unlisten?.();
+    };
+  }, []);
+
+  const handleUnlock = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const isValid = await invoke<boolean>("verify_app_password", { password: passwordInput });
+    if (isValid) {
+      setIsUnlocked(true);
+      setError("");
+      setPasswordInput("");
+    } else {
+      setError("Incorrect password. Please try again.");
+    }
+  };
+
+  const handleQuitConfirm = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const isValid = await invoke<boolean>("verify_app_password", { password: quitPasswordInput });
+    if (isValid) {
+      invoke("exit_app");
+    } else {
+      setQuitError("Incorrect password. Request denied.");
+    }
+  };
+
+  const handleLock = () => {
+    setIsUnlocked(false);
+  };
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-deep">
       <TitleBar />
 
       <div className="flex min-h-0 flex-1">
-        <Sidebar />
-        <main className="app-canvas min-w-0 flex-1 overflow-y-auto bg-background">
-          <BlockingHealthBanner />
-          <Outlet />
-        </main>
+        {!isUnlocked ? (
+          <div className="flex flex-1 flex-col items-center justify-center p-6 bg-background">
+            <div className="glass w-full max-w-sm rounded-xl border border-border/60 p-6 shadow-xl text-center space-y-4">
+              <AppIcon className="size-12 mx-auto rounded-xl" />
+              <h2 className="text-xl font-bold tracking-tight text-foreground">Focuser is Locked</h2>
+
+              {hasPassword ? (
+                <>
+                  <p className="text-sm text-muted-foreground leading-relaxed">
+                    App blocking is active in the background. Enter your password to continue.
+                  </p>
+                  <form onSubmit={handleUnlock} className="space-y-3 pt-2">
+                    <input
+                      type="password"
+                      placeholder="Enter Password"
+                      value={passwordInput}
+                      onChange={(e) => setPasswordInput(e.target.value)}
+                      className="w-full rounded-lg border border-border/60 bg-foreground/[0.02] px-3 py-2 text-foreground text-sm placeholder:text-muted-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                      autoFocus
+                    />
+                    {error && <p className="text-xs text-red-500 font-medium">{error}</p>}
+                    <button
+                      type="submit"
+                      className="w-full rounded-lg bg-primary py-2 font-semibold text-sm text-primary-foreground hover:bg-primary/90 transition-colors"
+                    >
+                      Unlock App
+                    </button>
+                  </form>
+                </>
+              ) : (
+                <>
+                  <p className="text-sm text-muted-foreground leading-relaxed">
+                    Set a password to protect your settings, or skip to enter without one.
+                  </p>
+                  <form
+                    onSubmit={async (e) => {
+                      e.preventDefault();
+                      const val = passwordInput.trim();
+                      if (val.length === 0) {
+                        setIsUnlocked(true);
+                      } else if (val.length < 4) {
+                        setError("Password must be at least 4 characters.");
+                      } else {
+                        // Securely hash and save password to backend disk file
+                        await invoke("set_app_password", { password: val });
+                        setHasPassword(true);
+                        setIsUnlocked(true);
+                        setError("");
+                      }
+                    }}
+                    className="space-y-3 pt-2"
+                  >
+                    <input
+                      type="password"
+                      placeholder="Set a password (optional)"
+                      value={passwordInput}
+                      onChange={(e) => setPasswordInput(e.target.value)}
+                      className="w-full rounded-lg border border-border/60 bg-foreground/[0.02] px-3 py-2 text-foreground text-sm placeholder:text-muted-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                      autoFocus
+                    />
+                    {error && <p className="text-xs text-red-500 font-medium">{error}</p>}
+                    <button
+                      type="submit"
+                      className="w-full rounded-lg bg-primary py-2 font-semibold text-sm text-primary-foreground hover:bg-primary/90 transition-colors"
+                    >
+                      {passwordInput.trim().length === 0 ? "Enter Without Password" : "Set Password & Unlock"}
+                    </button>
+                  </form>
+                </>
+              )}
+            </div>
+          </div>
+        ) : (
+          <>
+            <Sidebar hasPassword={hasPassword} onLock={handleLock} />
+            <main className="app-canvas min-w-0 flex-1 overflow-y-auto bg-background">
+              <BlockingHealthBanner />
+              <Outlet />
+            </main>
+          </>
+        )}
       </div>
+
+      {/* 🛑 Tray Quit Password Verification Modal Overlay */}
+      {showQuitModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div className="glass w-full max-w-sm rounded-xl border border-border/60 p-6 shadow-xl text-center space-y-4">
+            <h2 className="text-xl font-bold tracking-tight text-foreground">Quit Focuser</h2>
+            <p className="text-sm text-muted-foreground leading-relaxed">
+              Shutting down Focuser will disable all active blocking sessions. A password is required to exit.
+            </p>
+            
+            <form onSubmit={handleQuitConfirm} className="space-y-3 pt-2">
+              <input
+                type="password"
+                placeholder="Enter Password to Quit"
+                value={quitPasswordInput}
+                onChange={(e) => setQuitPasswordInput(e.target.value)}
+                className="w-full rounded-lg border border-border/60 bg-foreground/[0.02] px-3 py-2 text-foreground text-sm placeholder:text-muted-foreground focus:border-primary focus:outline-none focus:ring-1 focus:ring-primary"
+                autoFocus
+              />
+              {quitError && <p className="text-xs text-red-500 font-medium">{quitError}</p>}
+              
+              <div className="flex gap-2.5 pt-1">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowQuitModal(false);
+                    setQuitPasswordInput("");
+                    setQuitError("");
+                  }}
+                  className="flex-1 rounded-lg border border-border/60 py-2 font-semibold text-sm text-foreground hover:bg-foreground/[0.04] transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="flex-1 rounded-lg bg-red-600 py-2 font-semibold text-sm text-white hover:bg-red-500 transition-colors"
+                >
+                  Quit App
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-function Sidebar() {
+function Sidebar({ hasPassword, onLock }: { hasPassword: boolean; onLock: () => void }) {
   return (
     <nav
       aria-label={m.nav_landmark()}
@@ -73,16 +290,12 @@ function Sidebar() {
                 "transition-colors duration-150",
                 isActive
                   ? "bg-primary/12 text-foreground"
-                  : // A hairline tint on hover. The previous fill was a solid
-                    // block the width of the sidebar, which read as a selection.
-                    "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
               )
             }
           >
             {({ isActive }) => (
               <>
-                {/* A bar rather than a whole-row fill, so the current page is
-                    findable at a glance without a second colour block. */}
                 <span
                   aria-hidden
                   className={cn(
@@ -105,8 +318,37 @@ function Sidebar() {
         ))}
       </div>
 
-      {/* `mt-auto` on the group, not each child, or only the first moves. */}
       <div className="mt-auto flex flex-col gap-2 pt-3">
+        {!hasPassword ? (
+          <div className="rounded-lg border border-border/40 p-2.5 text-center space-y-1.5 bg-foreground/[0.01]">
+            <p className="text-[11px] text-muted-foreground leading-normal">
+              Protect settings with password:
+            </p>
+            <input
+              type="password"
+              placeholder="Type password & press Enter"
+              onKeyDown={async (e) => {
+                if (e.key === 'Enter') {
+                  const val = (e.target as HTMLInputElement).value;
+                  if (val.trim().length >= 4) {
+                    await invoke("set_app_password", { password: val });
+                    window.location.reload();
+                  } else {
+                    alert("Password must be at least 4 characters long.");
+                  }
+                }
+              }}
+              className="w-full rounded bg-foreground/[0.04] border border-border/40 px-2 py-1 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+            />
+          </div>
+        ) : (
+          <button
+            onClick={onLock}
+            className="flex items-center justify-center gap-2 rounded-lg border border-border/60 px-3 py-2 font-medium text-sm text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground transition-colors"
+          >
+            Lock Dashboard
+          </button>
+        )}
         <UpdatePill />
         <SessionPill />
       </div>
@@ -123,12 +365,6 @@ function Brand() {
   );
 }
 
-/**
- * A running focus session, pinned to the bottom of the sidebar.
- *
- * The countdown is the one thing worth seeing from every page — otherwise you
- * have to keep returning to the Dashboard to check it.
- */
 function SessionPill() {
   const status = usePomodoroStatus();
   if (!status.data) return null;
