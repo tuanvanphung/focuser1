@@ -131,10 +131,6 @@ export function AppLayout() {
     }
   };
 
-  const handleLock = () => {
-    setIsUnlocked(false);
-  };
-
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-deep">
       <TitleBar />
@@ -214,7 +210,7 @@ export function AppLayout() {
           </div>
         ) : (
           <>
-            <Sidebar hasPassword={hasPassword} onLock={handleLock} />
+            <Sidebar hasPassword={hasPassword} />
             <main className="app-canvas min-w-0 flex-1 overflow-y-auto bg-background">
               <BlockingHealthBanner />
               <Outlet />
@@ -270,7 +266,9 @@ export function AppLayout() {
   );
 }
 
-function Sidebar({ hasPassword, onLock }: { hasPassword: boolean; onLock: () => void }) {
+function Sidebar({ hasPassword }: { hasPassword: boolean }) {
+  const [isChangingPassword, setIsChangingPassword] = useState(false);
+
   return (
     <nav
       aria-label={m.nav_landmark()}
@@ -319,6 +317,7 @@ function Sidebar({ hasPassword, onLock }: { hasPassword: boolean; onLock: () => 
       </div>
 
       <div className="mt-auto flex flex-col gap-2 pt-3">
+        {/* Render setup input if no password exists */}
         {!hasPassword ? (
           <div className="rounded-lg border border-border/40 p-2.5 text-center space-y-1.5 bg-foreground/[0.01]">
             <p className="text-[11px] text-muted-foreground leading-normal">
@@ -341,12 +340,44 @@ function Sidebar({ hasPassword, onLock }: { hasPassword: boolean; onLock: () => 
               className="w-full rounded bg-foreground/[0.04] border border-border/40 px-2 py-1 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary"
             />
           </div>
+        ) : isChangingPassword ? (
+          /* Render inline edit input if Changing Password is active */
+          <div className="rounded-lg border border-border/40 p-2.5 text-center space-y-1.5 bg-foreground/[0.01]">
+            <p className="text-[11px] text-muted-foreground leading-normal">
+              Enter new password:
+            </p>
+            <input
+              type="password"
+              placeholder="New password & press Enter"
+              onKeyDown={async (e) => {
+                if (e.key === 'Enter') {
+                  const val = (e.target as HTMLInputElement).value;
+                  if (val.trim().length >= 4) {
+                    await invoke("set_app_password", { password: val });
+                    setIsChangingPassword(false);
+                    alert("Password updated successfully!");
+                  } else {
+                    alert("Password must be at least 4 characters long.");
+                  }
+                }
+              }}
+              className="w-full rounded bg-foreground/[0.04] border border-border/40 px-2 py-1 text-xs text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-primary"
+              autoFocus
+            />
+            <button
+              onClick={() => setIsChangingPassword(false)}
+              className="text-[10px] text-muted-foreground hover:text-foreground underline transition-colors block mx-auto pt-0.5"
+            >
+              Cancel
+            </button>
+          </div>
         ) : (
+          /* Render Change Password button */
           <button
-            onClick={onLock}
+            onClick={() => setIsChangingPassword(true)}
             className="flex items-center justify-center gap-2 rounded-lg border border-border/60 px-3 py-2 font-medium text-sm text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground transition-colors"
           >
-            Lock Dashboard
+            Change Password
           </button>
         )}
         <UpdatePill />

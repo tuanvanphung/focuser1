@@ -58,9 +58,9 @@ const EXTENSION_SEEN_SECS: u64 = 120;
 
 /// Securely terminates the application from the frontend
 #[tauri::command]
-fn exit_app() {
+fn exit_app(app_handle: tauri::AppHandle) {
     let _ = crate::blocker::remove_hosts_blocks();
-    std::process::exit(0);
+    app_handle.exit(0); // Gracefully exits and cleans up the tray icon
 }
 
 // --- SECURE BACKEND PASSWORD HELPERS & COMMANDS ---
@@ -181,6 +181,7 @@ fn main() {
             verify_app_password,  // Registered secure verify command
         ])
         .setup(move |app| {
+            // Reconcile autostart states natively (Tauri window remains hidden by default)
             if let Ok(engine) = state_for_blocker.engine.lock() {
                 autostart::reconcile(app.handle(), engine.db());
             }
@@ -246,7 +247,7 @@ fn main() {
                             let _ = window.emit("tray-quit-requested", ());
                         } else {
                             let _ = crate::blocker::remove_hosts_blocks();
-                            std::process::exit(0);
+                            app.exit(0); // Gracefully exits and cleans up the tray icon
                         }
                     }
                     _ => {}
