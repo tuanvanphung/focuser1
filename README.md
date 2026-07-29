@@ -1,3 +1,9 @@
+<p></p>
+<p>spin off for specialized changes</p>
+<p></p>
+
+
+
 <p align="center">
   <img src="assets/branding/focuser-banner.png" alt="Focuser — stop doomscrolling, start doing. Free and open source. Blocks websites and applications. Never leaves your computer." width="100%">
 </p>
