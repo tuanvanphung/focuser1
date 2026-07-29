@@ -1,5 +1,5 @@
 <p></p>
-<p>spin off for specialized changes</p>
+<p>spin off for customizations</p>
 <p></p>
 
 
